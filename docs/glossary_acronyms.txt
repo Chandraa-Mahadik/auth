@@ -1,0 +1,18 @@
+1. Glossary & Acronyms
+OAuth2 : Authorization framework that defines flows for clients to obtain access tokens from an Authorization Server to call protected APIs.
+OpenID Connect (OIDC) : Identity layer on top of OAuth2 that adds standardized user identity (ID tokens, userinfo endpoint).
+JWT (JSON Web Token) : Compact, signed token format (header.payload.signature) used to represent claims (e.g., user id, roles).
+Claim : A piece of information inside a token (e.g., sub, exp, scope, roles).
+Access Token : Short-lived token used by clients to access APIs.
+Refresh Token : Longer-lived token used to get new access tokens without re-authenticating.
+Token Expiry (exp) : Claim defining when a token becomes invalid.
+Scope : A named permission or capability (e.g., read:users, write:payments), often used in OAuth2/OIDC.
+RBAC (Role-Based Access Control) : Access control scheme where permissions are attached to roles, and roles are assigned to users.
+MFA (Multi-Factor Authentication) : Additional factor beyond password, like OTP via app/SMS, hardware key, etc.
+TOTP : Time-based one-time password (e.g., Google Authenticator).
+CSRF : Cross-Site Request Forgery, browser attack where a victim’s browser performs unwanted actions.
+CORS : Cross-Origin Resource Sharing, defines which domains can call your APIs from a browser.
+IdP (Identity Provider) : System that authenticates users and issues identity tokens (e.g., your Auth Server, Google).
+Authorization Code Flow : OAuth2/OIDC flow where the client obtains an authorization code via browser redirect, then exchanges it for tokens.
+PKCE : Proof Key for Code Exchange; mitigates interception attacks in Authorization Code Flow (especially for SPAs/mobile).
+JWK/JWKS : JSON Web Key (Set); public keys that clients use to verify JWT signatures.
