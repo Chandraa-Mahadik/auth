@@ -1,0 +1,5 @@
+TODO : 
+    - To have a config based implementation for each approach of authentication ( reference doc: authentication_practices.txt )
+
+----
+    - 

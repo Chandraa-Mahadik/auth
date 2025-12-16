@@ -1,0 +1,17 @@
+fastapi-auth/ ( auth )
+├─ .env
+├─ requirements.txt
+├─ alembic.ini
+├─ alembic/                        # (we’ll wire in Step 3)
+├─ app/
+│  ├─ main.py
+│  ├─ core/
+│  │  ├─ config.py
+│  │  ├─ logging.py
+│  │  └─ security.py
+│  ├─ db.py
+│  ├─ models.py
+│  ├─ schemas.py
+│  ├─ utils.py
+│  └─ routers/
+│     └─ auth.py

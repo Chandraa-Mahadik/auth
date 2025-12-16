@@ -1,2 +1,29 @@
 TODO : 
     - To have a config based implementation for each approach of authentication ( reference doc: authentication_practices.txt )
+
+---- 
+Objective In Short : 
+An OIDC + PKCE IdP has three responsibilities, not just “identify user”
+1️⃣ Authenticate the user
+“Who is this human?”
+Password / MFA / device / risk checks
+Creates IdP SSO session cookie
+Output: a user identity
+2️⃣ Authenticate the client app
+“Which app is asking?”
+client_id
+redirect_uri
+PKCE / client_secret
+App registration metadata
+📌 App identity is first-class, just like user identity.
+3️⃣ Issue tokens with claims
+“What is this user allowed to do in this app?”
+This is where your RBAC/ABAC question fits.
+
+----
+
+TODO : 
+Not to introduce these until the app runs clean locally and you’ve hardened refresh logic:
+    oauth_clients, authorization_codes, jwks_keys, etc.
+    MFA tables
+    notification outbox tables
