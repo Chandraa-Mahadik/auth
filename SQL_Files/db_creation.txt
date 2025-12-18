@@ -1,0 +1,30 @@
+# container creation command : 
+docker run -d \
+  --name auth_postgres \
+  -e POSTGRES_USER=auth_postgres_dev \
+  -e POSTGRES_PASSWORD=auth_dev#2025 \
+  -e POSTGRES_DB=auth_db_dev \
+  -p 5432:5432 \
+  -v auth_pgdata:/var/lib/postgresql \
+  postgres:18.1
+
+  ----
+# exec command
+docker exec -it auth_postgres psql -U auth_postgres_dev -d auth_db_dev
+
+
+# Created an app user with the below command.
+CREATE USER auth_app_user WITH PASSWORD 'auth_dev#QJ$2025e';
+
+# Provide permissions : 
+    # Connect to the database
+    # Use the schema
+    # Read/write tables 
+GRANT CONNECT ON DATABASE auth_db_dev TO auth_app_user;
+GRANT USAGE ON SCHEMA public TO auth_app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO auth_app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO auth_app_user;
+
+  ----
+
+

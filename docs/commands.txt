@@ -1,0 +1,6 @@
+✅ Best universal command
+Clears all __pycache__ folders and .pyc files anywhere in the repo:
+find . -type d -name "__pycache__" -exec rm -rf {} + && find . -name "*.pyc" -delete
+
+----
+
