@@ -1,11 +1,11 @@
-from fastapi import Body, APIRouter, Depends, HTTPException, status, Response, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 import logging
 import traceback
-from collections import defaultdict
 import time
+import uuid
 
 from app.db import get_session
 from app.models import User, Session, LoginEvent
@@ -15,33 +15,20 @@ from app.core.security import (
     create_access_token,
     new_refresh_token,
     hash_refresh_token,
-    decode_access_token,
 )
 from app.core.config import settings
 from app.utils import get_client_ip, parse_user_agent, subdomain_of
 from app.deps.auth import get_current_user
 
+# Redis-backed rate limiting
+from app.core.redis_client import get_redis
+from app.security.rate_limit import token_bucket_allow
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 log = logging.getLogger("app")
 
-# --- simple in-memory token bucket per IP for login ---
-RATE_BUCKET_SIZE = 5            # max attempts in bucket
-RATE_REFILL_PER_SEC = 0.1       # 1 token per 10s
-BUCKET = defaultdict(lambda: {"tokens": RATE_BUCKET_SIZE, "ts": time.monotonic()})
-
-def rate_limit_ok(ip: str | None) -> bool:
-    key = ip or "unknown"
-    now = time.monotonic()
-    b = BUCKET[key]
-    elapsed = now - b["ts"]
-    b["ts"] = now
-    b["tokens"] = min(RATE_BUCKET_SIZE, b["tokens"] + elapsed * RATE_REFILL_PER_SEC)
-    if b["tokens"] >= 1:
-        b["tokens"] -= 1
-        return True
-    return False
-
 REFRESH_COOKIE_NAME = "refresh_token"
+
 
 def set_refresh_cookie(response: Response, token: str, *, secure: bool):
     response.set_cookie(
@@ -55,12 +42,14 @@ def set_refresh_cookie(response: Response, token: str, *, secure: bool):
         path="/auth",
     )
 
+
 def clear_refresh_cookie(response: Response):
     response.delete_cookie(
         key=REFRESH_COOKIE_NAME,
         domain=settings.APP_COOKIE_DOMAIN or None,
         path="/auth",
     )
+
 
 @router.post("/login", response_model=TokenOut)
 async def login(
@@ -72,12 +61,34 @@ async def login(
     ip = get_client_ip(request)
 
     try:
-        if not rate_limit_ok(ip):
+        # --- Redis-backed token bucket limiter (IP + email) ---
+        redis = get_redis()
+
+        email_norm = (payload.email or "").strip().lower()
+        ip_key = f"rl:login:ip:{ip or 'unknown'}"
+        email_key = f"rl:login:email:{email_norm or 'unknown'}"
+
+        ip_allowed = await token_bucket_allow(
+            redis,
+            ip_key,
+            capacity=settings.RATE_BUCKET_SIZE,
+            refill_per_sec=settings.RATE_REFILL_PER_SEC,
+        )
+        email_allowed = await token_bucket_allow(
+            redis,
+            email_key,
+            capacity=settings.RATE_BUCKET_SIZE,
+            refill_per_sec=settings.RATE_REFILL_PER_SEC,
+        )
+
+        if not ip_allowed or not email_allowed:
+            reason = "rate_limited_ip" if not ip_allowed else "rate_limited_email"
+
             session.add(
                 LoginEvent(
                     user_id=None,
                     success=False,
-                    failure_reason="rate_limited",
+                    failure_reason=reason,
                     ip=ip,
                     user_agent=request.headers.get("user-agent"),
                     device=parse_user_agent(request.headers.get("user-agent")),
@@ -94,15 +105,14 @@ async def login(
         res = await session.execute(select(User).where(User.email == payload.email))
         user = res.scalar_one_or_none()
 
-        if not user or not user.is_active or not verify_password(
-            payload.password, user.password_hash
-        ):
+        if not user or not user.is_active or not verify_password(payload.password, user.password_hash):
             if user:
                 await session.execute(
                     update(User)
                     .where(User.user_id == user.user_id)
                     .values(failed_login_count=User.failed_login_count + 1)
                 )
+
             session.add(
                 LoginEvent(
                     user_id=(user.user_id if user else None),
@@ -118,10 +128,11 @@ async def login(
             await session.commit()
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-        # session + refresh
+        # session + refresh (NEW login = NEW session family)
         refresh_plain, refresh_hash = new_refresh_token()
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRES_DAYS)
+
         sess = Session(
             user_id=user.user_id,
             refresh_token_hash=refresh_hash,
@@ -129,6 +140,7 @@ async def login(
             user_agent=request.headers.get("user-agent"),
             device=parse_user_agent(request.headers.get("user-agent")),
             expires_at=expires_at,
+            session_family_id=uuid.uuid4(),  # ✅ Step 3: family root
         )
         session.add(sess)
 
@@ -138,6 +150,7 @@ async def login(
             .where(User.user_id == user.user_id)
             .values(last_login_at=now, failed_login_count=0)
         )
+
         session.add(
             LoginEvent(
                 user_id=user.user_id,
@@ -152,10 +165,10 @@ async def login(
         )
         await session.commit()
 
-        # mint access (UTC iat/exp inside)
         uid = str(user.user_id)
         if not uid:
             raise HTTPException(status_code=500, detail="User id missing")
+
         access = create_access_token(uid, extra={"email": user.email})
 
         # DEV: make responses non-cacheable and surface timing explicitly
@@ -168,6 +181,7 @@ async def login(
 
         secure_flag = (request.url.scheme == "https") and bool(settings.APP_COOKIE_DOMAIN)
         set_refresh_cookie(response, refresh_plain, secure=secure_flag)
+
         return TokenOut(access_token=access)
 
     except HTTPException:
@@ -184,6 +198,7 @@ async def login(
         )
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 @router.post("/refresh", response_model=TokenOut)
 async def refresh(
     request: Request,
@@ -194,29 +209,117 @@ async def refresh(
     if not token_plain:
         raise HTTPException(status_code=401, detail="No refresh token")
 
+    ip = get_client_ip(request)
+    ua = request.headers.get("user-agent")
+    device = parse_user_agent(ua)
+
     try:
         token_hash = hash_refresh_token(token_plain)
+        now = datetime.now(timezone.utc)
+
+        # 1) Happy path: token matches an ACTIVE session
         res = await session.execute(
             select(Session, User)
             .join(User, Session.user_id == User.user_id)
             .where(
                 Session.refresh_token_hash == token_hash,
-                Session.revoked == False,
-                Session.expires_at > datetime.now(timezone.utc),
+                Session.revoked_at.is_(None),
+                Session.expires_at > now,
             )
         )
         row = res.first()
+
         if not row:
+            # 2) Not found as active. Check if token belongs to a session that was already rotated.
+            res2 = await session.execute(select(Session).where(Session.refresh_token_hash == token_hash))
+            old_sess = res2.scalar_one_or_none()
+
+            # Only treat as "reuse" if this session was actually replaced (i.e., rotated away),
+            # OR already revoked for rotation (revoked_reason='rotated'), etc.
+            is_reuse_candidate = (
+                old_sess is not None
+                and old_sess.session_family_id is not None
+                and (
+                    old_sess.replaced_by_session_id is not None
+                    or (old_sess.revoked_reason == "rotated")
+                )
+            )
+
+            if is_reuse_candidate:
+                family_id = old_sess.session_family_id
+
+                # 🚨 Compromise: revoke all currently-active sessions in this family
+                await session.execute(
+                    update(Session)
+                    .where(
+                        Session.session_family_id == family_id,
+                        Session.revoked_at.is_(None),
+                    )
+                    .values(
+                        revoked_at=now,
+                        revoked_reason="compromised_refresh_reuse",
+                        compromised_at=now,
+                        compromised_reason="refresh_token_reuse_detected",
+                    )
+                )
+
+                # log as security event (reuse LoginEvent for now)
+                session.add(
+                    LoginEvent(
+                        user_id=old_sess.user_id,
+                        success=False,
+                        failure_reason="refresh_token_reuse",
+                        ip=ip,
+                        user_agent=ua,
+                        device=device,
+                        app_base_url=None,
+                        subdomain=None,
+                    )
+                )
+
+                await session.commit()
+                clear_refresh_cookie(response)
+                raise HTTPException(
+                    status_code=401,
+                    detail="Refresh token reuse detected. Please login again.",
+                )
+
+            # Otherwise: invalid/expired refresh token
+            clear_refresh_cookie(response)
             raise HTTPException(status_code=401, detail="Invalid/expired refresh")
 
-        sess, user = row[0], row[1]
+        # 3) Normal rotation: create NEW session row, link old -> new, revoke old
+        old_session, user = row[0], row[1]
+
         new_plain, new_hash = new_refresh_token()
-        sess.refresh_token_hash = new_hash
-        sess.last_seen_at = datetime.now(timezone.utc)
+
+        family_id = old_session.session_family_id or uuid.uuid4()
+
+        new_session = Session(
+            user_id=user.user_id,
+            refresh_token_hash=new_hash,
+            ip=ip,
+            user_agent=ua,
+            device=device,
+            expires_at=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRES_DAYS),
+            session_family_id=family_id,
+            last_seen_at=now,
+        )
+        session.add(new_session)
+        await session.flush()  # ensures new_session.session_id exists
+
+        # revoke and link old
+        old_session.replaced_by_session_id = new_session.session_id
+        old_session.revoked_at = now
+        old_session.revoked_reason = "rotated"
+        old_session.rotated_at = now
+        old_session.last_seen_at = now
+
         await session.commit()
 
         secure_flag = (request.url.scheme == "https") and bool(settings.APP_COOKIE_DOMAIN)
         set_refresh_cookie(response, new_plain, secure=secure_flag)
+
         access = create_access_token(str(user.user_id), extra={"email": user.email})
         return TokenOut(access_token=access)
 
@@ -234,6 +337,7 @@ async def refresh(
         )
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 @router.post("/logout")
 async def logout(
     request: Request, response: Response, session: AsyncSession = Depends(get_session)
@@ -243,15 +347,19 @@ async def logout(
         token_hash = hash_refresh_token(token_plain)
         res = await session.execute(
             select(Session).where(
-                Session.refresh_token_hash == token_hash, Session.revoked == False
+                Session.refresh_token_hash == token_hash,
+                Session.revoked_at.is_(None),
             )
         )
         sess = res.scalar_one_or_none()
         if sess:
-            sess.revoked = True
+            sess.revoked_at = datetime.now(timezone.utc)
+            sess.revoked_reason = "logout"
             await session.commit()
+
     clear_refresh_cookie(response)
     return {"ok": True}
+
 
 @router.get("/me")
 async def me(user: User = Depends(get_current_user)):
@@ -265,31 +373,3 @@ async def me(user: User = Depends(get_current_user)):
         "updated_at": user.updated_at,
         "failed_login_count": user.failed_login_count,
     }
-
-# --- DEV-ONLY token inspector: shows verified or unverified payload & server now ---
-@router.post("/token/inspect")
-def token_inspect(token: str = Body(..., embed=True)):
-    import jwt, time
-    try:
-        payload = decode_access_token(token)
-        return {"ok": True, "verified": True, "payload": payload, "now_epoch": int(time.time())}
-    except Exception as e:
-        try:
-            unverified = jwt.decode(token, options={"verify_signature": False})
-        except Exception:
-            unverified = None
-        return {
-            "ok": False,
-            "verified": False,
-            "error": str(e),
-            "unverified_payload": unverified,
-            "now_epoch": int(time.time()),
-        }
-
-# --- DEV-ONLY: create a token now and show its payload & server time ---
-@router.post("/token/mint-debug")
-def token_mint_debug(user_id: str = Body(..., embed=True)):
-    import jwt, time
-    tok = create_access_token(user_id, extra={"email": "debug@example.com"})
-    payload = jwt.decode(tok, options={"verify_signature": False})
-    return {"now_epoch": int(time.time()), "token": tok, "payload": payload}
