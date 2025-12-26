@@ -30,6 +30,10 @@ log = logging.getLogger("app")
 REFRESH_COOKIE_NAME = "refresh_token"
 
 
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def set_refresh_cookie(response: Response, token: str, *, secure: bool):
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
@@ -59,12 +63,14 @@ async def login(
     session: AsyncSession = Depends(get_session),
 ):
     ip = get_client_ip(request)
+    ua = request.headers.get("user-agent")
+    device = parse_user_agent(ua)
 
     try:
         # --- Redis-backed token bucket limiter (IP + email) ---
         redis = get_redis()
-
         email_norm = (payload.email or "").strip().lower()
+
         ip_key = f"rl:login:ip:{ip or 'unknown'}"
         email_key = f"rl:login:email:{email_norm or 'unknown'}"
 
@@ -90,18 +96,16 @@ async def login(
                     success=False,
                     failure_reason=reason,
                     ip=ip,
-                    user_agent=request.headers.get("user-agent"),
-                    device=parse_user_agent(request.headers.get("user-agent")),
+                    user_agent=ua,
+                    device=device,
                     app_base_url=(str(payload.app_base_url) if payload.app_base_url else None),
                     subdomain=subdomain_of(payload.app_base_url),
                 )
             )
             await session.commit()
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many attempts. Please wait.",
-            )
+            raise HTTPException(status_code=429, detail="Too many attempts. Please wait.")
 
+        # --- auth check ---
         res = await session.execute(select(User).where(User.email == payload.email))
         user = res.scalar_one_or_none()
 
@@ -119,32 +123,34 @@ async def login(
                     success=False,
                     failure_reason=("inactive" if user and not user.is_active else "bad_credentials"),
                     ip=ip,
-                    user_agent=request.headers.get("user-agent"),
-                    device=parse_user_agent(request.headers.get("user-agent")),
+                    user_agent=ua,
+                    device=device,
                     app_base_url=(str(payload.app_base_url) if payload.app_base_url else None),
                     subdomain=subdomain_of(payload.app_base_url),
                 )
             )
             await session.commit()
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        # session + refresh (NEW login = NEW session family)
+        # --- create a NEW family for this device-login ---
+        family_id = uuid.uuid4()
+
         refresh_plain, refresh_hash = new_refresh_token()
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRES_DAYS)
 
         sess = Session(
             user_id=user.user_id,
             refresh_token_hash=refresh_hash,
             ip=ip,
-            user_agent=request.headers.get("user-agent"),
-            device=parse_user_agent(request.headers.get("user-agent")),
+            user_agent=ua,
+            device=device,
             expires_at=expires_at,
-            session_family_id=uuid.uuid4(),  # ✅ Step 3: family root
+            session_family_id=family_id,
+            last_seen_at=now,
         )
         session.add(sess)
 
-        # audit + user stats
         await session.execute(
             update(User)
             .where(User.user_id == user.user_id)
@@ -157,21 +163,18 @@ async def login(
                 success=True,
                 failure_reason=None,
                 ip=ip,
-                user_agent=request.headers.get("user-agent"),
-                device=parse_user_agent(request.headers.get("user-agent")),
+                user_agent=ua,
+                device=device,
                 app_base_url=(str(payload.app_base_url) if payload.app_base_url else None),
                 subdomain=subdomain_of(payload.app_base_url),
             )
         )
+
         await session.commit()
 
-        uid = str(user.user_id)
-        if not uid:
-            raise HTTPException(status_code=500, detail="User id missing")
+        access = create_access_token(str(user.user_id), extra={"email": user.email})
 
-        access = create_access_token(uid, extra={"email": user.email})
-
-        # DEV: make responses non-cacheable and surface timing explicitly
+        # DEV headers (optional)
         import jwt
         payload_dbg = jwt.decode(access, options={"verify_signature": False})
         response.headers["Cache-Control"] = "no-store"
@@ -181,21 +184,13 @@ async def login(
 
         secure_flag = (request.url.scheme == "https") and bool(settings.APP_COOKIE_DOMAIN)
         set_refresh_cookie(response, refresh_plain, secure=secure_flag)
-
         return TokenOut(access_token=access)
 
     except HTTPException:
         raise
     except Exception as e:
         await session.rollback()
-        log.error(
-            "login_unhandled_error",
-            extra={
-                "request_id": getattr(request.state, "request_id", None),
-                "error": str(e),
-                "trace": traceback.format_exc(),
-            },
-        )
+        log.error("login_unhandled_error", extra={"error": str(e), "trace": traceback.format_exc()})
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
@@ -214,10 +209,10 @@ async def refresh(
     device = parse_user_agent(ua)
 
     try:
+        now = utcnow()
         token_hash = hash_refresh_token(token_plain)
-        now = datetime.now(timezone.utc)
 
-        # 1) Happy path: token matches an ACTIVE session
+        # 1) Find ACTIVE session
         res = await session.execute(
             select(Session, User)
             .join(User, Session.user_id == User.user_id)
@@ -230,31 +225,16 @@ async def refresh(
         row = res.first()
 
         if not row:
-            # 2) Not found as active. Check if token belongs to a session that was already rotated.
+            # 2) Reuse detection check (token exists but no longer active)
             res2 = await session.execute(select(Session).where(Session.refresh_token_hash == token_hash))
             old_sess = res2.scalar_one_or_none()
 
-            # Only treat as "reuse" if this session was actually replaced (i.e., rotated away),
-            # OR already revoked for rotation (revoked_reason='rotated'), etc.
-            is_reuse_candidate = (
-                old_sess is not None
-                and old_sess.session_family_id is not None
-                and (
-                    old_sess.replaced_by_session_id is not None
-                    or (old_sess.revoked_reason == "rotated")
-                )
-            )
-
-            if is_reuse_candidate:
+            if old_sess and old_sess.session_family_id:
                 family_id = old_sess.session_family_id
 
-                # 🚨 Compromise: revoke all currently-active sessions in this family
                 await session.execute(
                     update(Session)
-                    .where(
-                        Session.session_family_id == family_id,
-                        Session.revoked_at.is_(None),
-                    )
+                    .where(Session.session_family_id == family_id, Session.revoked_at.is_(None))
                     .values(
                         revoked_at=now,
                         revoked_reason="compromised_refresh_reuse",
@@ -263,7 +243,6 @@ async def refresh(
                     )
                 )
 
-                # log as security event (reuse LoginEvent for now)
                 session.add(
                     LoginEvent(
                         user_id=old_sess.user_id,
@@ -279,22 +258,18 @@ async def refresh(
 
                 await session.commit()
                 clear_refresh_cookie(response)
-                raise HTTPException(
-                    status_code=401,
-                    detail="Refresh token reuse detected. Please login again.",
-                )
+                raise HTTPException(status_code=401, detail="Refresh token reuse detected. Please login again.")
 
-            # Otherwise: invalid/expired refresh token
-            clear_refresh_cookie(response)
             raise HTTPException(status_code=401, detail="Invalid/expired refresh")
 
-        # 3) Normal rotation: create NEW session row, link old -> new, revoke old
         old_session, user = row[0], row[1]
 
-        new_plain, new_hash = new_refresh_token()
-
+        # Ensure family_id exists (for old legacy rows)
         family_id = old_session.session_family_id or uuid.uuid4()
+        old_session.session_family_id = family_id  # critical: keep old in family too
 
+        # Create new session row (rotation)
+        new_plain, new_hash = new_refresh_token()
         new_session = Session(
             user_id=user.user_id,
             refresh_token_hash=new_hash,
@@ -306,9 +281,9 @@ async def refresh(
             last_seen_at=now,
         )
         session.add(new_session)
-        await session.flush()  # ensures new_session.session_id exists
+        await session.flush()  # new_session.session_id available
 
-        # revoke and link old
+        # Link and revoke old session
         old_session.replaced_by_session_id = new_session.session_id
         old_session.revoked_at = now
         old_session.revoked_reason = "rotated"
@@ -327,24 +302,28 @@ async def refresh(
         raise
     except Exception as e:
         await session.rollback()
-        log.error(
-            "refresh_unhandled_error",
-            extra={
-                "request_id": getattr(request.state, "request_id", None),
-                "error": str(e),
-                "trace": traceback.format_exc(),
-            },
-        )
+        log.error("refresh_unhandled_error", extra={"error": str(e), "trace": traceback.format_exc()})
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 @router.post("/logout")
 async def logout(
-    request: Request, response: Response, session: AsyncSession = Depends(get_session)
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
 ):
+    """
+    Device logout: revoke the entire session family for the refresh token presented.
+    """
     token_plain = request.cookies.get(REFRESH_COOKIE_NAME)
-    if token_plain:
+    if not token_plain:
+        clear_refresh_cookie(response)
+        return {"ok": True}
+
+    try:
+        now = utcnow()
         token_hash = hash_refresh_token(token_plain)
+
         res = await session.execute(
             select(Session).where(
                 Session.refresh_token_hash == token_hash,
@@ -352,13 +331,104 @@ async def logout(
             )
         )
         sess = res.scalar_one_or_none()
-        if sess:
-            sess.revoked_at = datetime.now(timezone.utc)
-            sess.revoked_reason = "logout"
+
+        if sess and sess.session_family_id:
+            await session.execute(
+                update(Session)
+                .where(Session.session_family_id == sess.session_family_id, Session.revoked_at.is_(None))
+                .values(revoked_at=now, revoked_reason="logout_family")
+            )
             await session.commit()
 
-    clear_refresh_cookie(response)
-    return {"ok": True}
+        clear_refresh_cookie(response)
+        return {"ok": True}
+
+    except Exception as e:
+        await session.rollback()
+        log.error("logout_unhandled_error", extra={"error": str(e), "trace": traceback.format_exc()})
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@router.post("/logout-all")
+async def logout_all(
+    request: Request,
+    response: Response,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Logout from all devices: revoke ALL active sessions for the user.
+    """
+    try:
+        now = utcnow()
+        await session.execute(
+            update(Session)
+            .where(Session.user_id == user.user_id, Session.revoked_at.is_(None))
+            .values(revoked_at=now, revoked_reason="logout_all")
+        )
+        await session.commit()
+        clear_refresh_cookie(response)
+        return {"ok": True}
+    except Exception as e:
+        await session.rollback()
+        log.error("logout_all_unhandled_error", extra={"error": str(e), "trace": traceback.format_exc()})
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@router.get("/sessions")
+async def list_sessions(
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    List sessions for the current user (active + recently revoked).
+    """
+    try:
+        # show last N days; tune as needed
+        cutoff = utcnow() - timedelta(days=30)
+
+        res = await session.execute(
+            select(Session)
+            .where(Session.user_id == user.user_id)
+            .order_by(Session.created_at.desc())  # assuming created_at exists
+        )
+        rows = res.scalars().all()
+
+        token_plain = request.cookies.get(REFRESH_COOKIE_NAME)
+        token_hash = hash_refresh_token(token_plain) if token_plain else None
+
+        out = []
+        for s in rows:
+            if getattr(s, "created_at", None) and s.created_at < cutoff:
+                # keep old if still active; otherwise skip
+                if s.revoked_at is not None:
+                    continue
+
+            out.append(
+                {
+                    "session_id": str(s.session_id),
+                    "session_family_id": str(s.session_family_id) if s.session_family_id else None,
+                    "is_current_cookie_session": (token_hash is not None and s.refresh_token_hash == token_hash),
+                    "ip": s.ip,
+                    "device": s.device,
+                    "user_agent": s.user_agent,
+                    "created_at": s.created_at,
+                    "last_seen_at": s.last_seen_at,
+                    "expires_at": s.expires_at,
+                    "revoked_at": s.revoked_at,
+                    "revoked_reason": s.revoked_reason,
+                    "replaced_by_session_id": str(s.replaced_by_session_id) if s.replaced_by_session_id else None,
+                    "compromised_at": s.compromised_at,
+                    "compromised_reason": s.compromised_reason,
+                }
+            )
+
+        return {"items": out}
+
+    except Exception as e:
+        log.error("list_sessions_unhandled_error", extra={"error": str(e), "trace": traceback.format_exc()})
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 @router.get("/me")

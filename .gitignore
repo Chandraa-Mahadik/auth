@@ -145,6 +145,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# db creation data
+SQL_Files/db_creation.txt
+
 # Spyder project settings
 .spyderproject
 .spyproject
