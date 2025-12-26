@@ -24,35 +24,37 @@ from app.deps.auth import get_current_user
 from app.core.redis_client import get_redis
 from app.security.rate_limit import token_bucket_allow
 
+from app.core.cookies import set_refresh_cookie, clear_refresh_cookie
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 log = logging.getLogger("app")
 
-REFRESH_COOKIE_NAME = "refresh_token"
+# REFRESH_COOKIE_NAME = "refresh_token"
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def set_refresh_cookie(response: Response, token: str, *, secure: bool):
-    response.set_cookie(
-        key=REFRESH_COOKIE_NAME,
-        value=token,
-        httponly=True,
-        secure=secure,  # True in prod (https + domain), False on localhost
-        samesite="lax",
-        domain=settings.APP_COOKIE_DOMAIN or None,
-        max_age=settings.REFRESH_TOKEN_EXPIRES_DAYS * 24 * 3600,
-        path="/auth",
-    )
+# def set_refresh_cookie(response: Response, token: str, *, secure: bool):
+#     response.set_cookie(
+#         key=REFRESH_COOKIE_NAME,
+#         value=token,
+#         httponly=True,
+#         secure=secure,  # True in prod (https + domain), False on localhost
+#         samesite="lax",
+#         domain=settings.APP_COOKIE_DOMAIN or None,
+#         max_age=settings.REFRESH_TOKEN_EXPIRES_DAYS * 24 * 3600,
+#         path="/auth",
+#     )
 
 
-def clear_refresh_cookie(response: Response):
-    response.delete_cookie(
-        key=REFRESH_COOKIE_NAME,
-        domain=settings.APP_COOKIE_DOMAIN or None,
-        path="/auth",
-    )
+# def clear_refresh_cookie(response: Response):
+#     response.delete_cookie(
+#         key=REFRESH_COOKIE_NAME,
+#         domain=settings.APP_COOKIE_DOMAIN or None,
+#         path="/auth",
+#     )
 
 
 @router.post("/login", response_model=TokenOut)
