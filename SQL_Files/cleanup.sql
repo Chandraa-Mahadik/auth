@@ -15,6 +15,11 @@ WHERE (revoked_at IS NOT NULL AND revoked_at < now() - interval '30 days')
 DELETE FROM login_events
 WHERE occurred_at < now() - interval '90 days';
 
+-- password_reset_tokens: remove old used/expired
+DELETE FROM password_reset_tokens
+WHERE (used_at IS NOT NULL AND used_at < now() - interval '30 days')
+   OR (expires_at < now() - interval '30 days');
+
 COMMIT;
 
 --
