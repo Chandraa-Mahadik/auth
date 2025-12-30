@@ -134,3 +134,37 @@ class LoginEvent(Base):
 
 # Optional index if you query by time a lot:
 Index("idx_login_events_occurred_at", LoginEvent.occurred_at)
+
+
+# ---- PASSWORD RESET TOKENS ----
+class PasswordResetToken(Base):
+    """Stores *hashed* password reset tokens.
+
+    Security notes:
+    - Never store the plain token.
+    - Single-use via used_at.
+    - Short TTL via expires_at.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    requested_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    requested_user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+Index("idx_password_reset_tokens_user_id", PasswordResetToken.user_id)
+Index("idx_password_reset_tokens_expires_at", PasswordResetToken.expires_at)

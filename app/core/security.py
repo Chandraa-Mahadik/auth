@@ -1,13 +1,20 @@
 import datetime as dt
+from typing import Any, Dict, Optional, Tuple
+
 import jwt
 from jwt import InvalidTokenError
-from typing import Any, Dict
+
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+
 from app.core.config import settings
 
-# Reasonable Argon2 defaults for auth
+# Reasonable Argon2 defaults for auth (tune as needed)
 ph = PasswordHasher(time_cost=2, memory_cost=102400, parallelism=8)
+
+# -------------------------------------------------------------------
+# Password hashing (Argon2)
+# -------------------------------------------------------------------
 
 def hash_password(plain: str) -> str:
     return ph.hash(plain)
@@ -18,12 +25,19 @@ def verify_password(plain: str, hashed: str) -> bool:
     except VerifyMismatchError:
         return False
 
-def create_access_token(sub: str, extra: Dict[str, Any] | None = None) -> str:
+# ✅ Compatibility alias: many codebases use this name
+def get_password_hash(plain: str) -> str:
+    return hash_password(plain)
+
+# -------------------------------------------------------------------
+# JWT Access tokens
+# -------------------------------------------------------------------
+
+def create_access_token(sub: str, extra: Optional[Dict[str, Any]] = None) -> str:
     """
-    Always use *aware* UTC datetimes so .timestamp() yields true UTC seconds.
-    Clamp TTL to >= 1 minute to prevent zero-minute tokens from .env issues.
+    Always use aware UTC datetimes so .timestamp() yields true UTC seconds.
+    Clamp TTL to >= 1 minute to prevent zero-minute tokens from env issues.
     """
-    # AWARE UTC datetime (critical fix vs. naive utcnow())
     now = dt.datetime.now(dt.timezone.utc)
 
     try:
@@ -57,7 +71,20 @@ def decode_access_token(token: str) -> dict:
         leeway=30,
     )
 
-def new_refresh_token() -> tuple[str, str]:
+def get_jwt_subject(payload: dict) -> str:
+    """
+    Centralized extraction of subject with consistent error semantics.
+    """
+    sub = payload.get("sub")
+    if not sub:
+        raise InvalidTokenError("Missing subject (sub)")
+    return sub
+
+# -------------------------------------------------------------------
+# Refresh tokens (opaque; store only hash)
+# -------------------------------------------------------------------
+
+def new_refresh_token() -> Tuple[str, str]:
     import secrets, hashlib
     token = secrets.token_urlsafe(64)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -66,9 +93,3 @@ def new_refresh_token() -> tuple[str, str]:
 def hash_refresh_token(token_plain: str) -> str:
     import hashlib
     return hashlib.sha256(token_plain.encode("utf-8")).hexdigest()
-
-def get_jwt_subject(payload: dict) -> str:
-    sub = payload.get("sub")
-    if not sub:
-        raise InvalidTokenError("Missing subject (sub)")
-    return sub

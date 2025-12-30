@@ -24,7 +24,7 @@ from app.deps.auth import get_current_user
 from app.core.redis_client import get_redis
 from app.security.rate_limit import token_bucket_allow
 
-from app.core.cookies import set_refresh_cookie, clear_refresh_cookie
+from app.core.cookies import set_refresh_cookie, clear_refresh_cookie, REFRESH_COOKIE_NAME
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 log = logging.getLogger("app")
@@ -174,7 +174,10 @@ async def login(
 
         await session.commit()
 
-        access = create_access_token(str(user.user_id), extra={"email": user.email})
+        access = create_access_token(
+            str(user.user_id),
+            extra={"email": user.email, "tv": int(user.token_version or 0)},
+        )
 
         # DEV headers (optional)
         import jwt
@@ -297,7 +300,11 @@ async def refresh(
         secure_flag = (request.url.scheme == "https") and bool(settings.APP_COOKIE_DOMAIN)
         set_refresh_cookie(response, new_plain, secure=secure_flag)
 
-        access = create_access_token(str(user.user_id), extra={"email": user.email})
+        access = create_access_token(
+            str(user.user_id),
+            extra={"email": user.email, "tv": int(user.token_version or 0)},
+        )
+
         return TokenOut(access_token=access)
 
     except HTTPException:

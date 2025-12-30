@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     RATE_BUCKET_SIZE: int = 5
     RATE_REFILL_PER_SEC: float = 0.1
     
+    # Password reset
+    PASSWORD_RESET_TOKEN_MINUTES: int = 30
+    PASSWORD_RESET_TOKEN_BYTES: int = 32  # token entropy
+    PASSWORD_RESET_RATE_BUCKET_SIZE: int = 5
+    PASSWORD_RESET_RATE_REFILL_PER_SEC: float = 0.02  # ~1 request / 50 sec
+    PASSWORD_RESET_EMAIL_COOLDOWN_SEC: int = 60
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
