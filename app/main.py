@@ -31,6 +31,10 @@ app.add_middleware(RequestIDMiddleware)
 # ✅ Always mounted
 app.include_router(auth_router)
 
+from app.core.config import settings
+import logging
+logging.getLogger("app").warning(f"BOOT DATABASE_URL = {settings.DATABASE_URL}")
+
 # ✅ Mount optional routers if present
 if password_reset_router is not None:
     app.include_router(password_reset_router)
@@ -72,10 +76,20 @@ app.openapi = custom_openapi
 
 @app.get("/healthz")
 def health():
+    logging.getLogger("app").warning(f"BOOT DATABASE_URL = {settings.DATABASE_URL}")
     return {"status": "ok"}
 
 
 @app.get("/healthz/db")
 async def health_db(session: AsyncSession = Depends(get_session)):
-    await session.execute(text("SELECT 1"))
-    return {"db": "ok"}
+    # await session.execute(text("SELECT 1"))
+    row = (await session.execute(text("""
+        SELECT
+          current_database() AS db,
+          current_user AS usr,
+          inet_server_addr() AS server_ip,
+          inet_server_port() AS server_port,
+          current_schema() AS schema
+    """))).mappings().one()
+    return {"db": "ok", **dict(row)}
+    # return {"db": "ok"}

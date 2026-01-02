@@ -1,4 +1,8 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = Path(__file__).resolve().parents[2]  # points to project root (auth/)
+ENV_FILE = BASE_DIR / ".env"
 
 class Settings(BaseSettings):
     DATABASE_URL: str
@@ -20,6 +24,11 @@ class Settings(BaseSettings):
     PASSWORD_RESET_RATE_REFILL_PER_SEC: float = 0.02  # ~1 request / 50 sec
     PASSWORD_RESET_EMAIL_COOLDOWN_SEC: int = 60
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
+    # model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_file=str(ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 settings = Settings()
