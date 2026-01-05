@@ -21,6 +21,8 @@ from app.services.mailer import DevMailer
 
 from app.core.cookies import clear_refresh_cookie
 
+from app.services.security_events import write_security_event  # ✅ ADD
+
 
 router = APIRouter(prefix="/auth/password", tags=["auth-password"])
 mailer = DevMailer()
@@ -64,21 +66,48 @@ async def forgot_password(
 
     # Still return OK (anti-enumeration)
     if not ip_allowed or not email_allowed:
+        # ✅ Security signal: rate limited password reset (high severity)
+        await write_security_event(
+            session,
+            event_type="password_reset_rate_limited",
+            severity="high",
+            details={"email": email_norm},
+            request=request,
+        )
+        await session.commit()
         return {"ok": True}
 
     # --- user lookup ---
     res = await session.execute(select(User).where(User.email == email_norm))
     user = res.scalar_one_or_none()
 
+    # IMPORTANT: do NOT log user_not_found as an external signal; internal security log is OK.
     if not user or not user.is_active:
+        await write_security_event(
+            session,
+            event_type="password_reset_requested_unknown_or_inactive",
+            severity="info",
+            details={"email": email_norm},
+            request=request,
+        )
+        await session.commit()
         return {"ok": True}
+
+    # ✅ Security event: password reset requested (for a real active user)
+    await write_security_event(
+        session,
+        event_type="password_reset_requested",
+        severity="info",
+        user_id=user.user_id,
+        details={"email": email_norm},
+        request=request,
+    )
 
     # --- create reset token ---
     token_plain = new_password_reset_token()
     token_hash = hash_password_reset_token(token_plain)
     expires_at = _now_utc() + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_MINUTES)
 
-    # ✅ Correct insertion (ORM insert) — fixes your SQLAlchemy "text()" crash
     await session.execute(
         insert(PasswordResetToken).values(
             user_id=user.user_id,
@@ -143,38 +172,62 @@ async def reset_password(
     )
     prt = res_token.scalar_one_or_none()
     if not prt:
+        # ✅ Security event: invalid/expired reset attempt
+        await write_security_event(
+            session,
+            event_type="password_reset_failed_invalid_or_expired",
+            severity="warning",
+            details={},
+            request=request,
+        )
+        await session.commit()
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     # 2) Load user
     res_user = await session.execute(select(User).where(User.user_id == prt.user_id))
     user = res_user.scalar_one_or_none()
     if not user or not user.is_active:
+        await write_security_event(
+            session,
+            event_type="password_reset_failed_invalid_or_expired",
+            severity="warning",
+            details={},
+            request=request,
+        )
+        await session.commit()
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    # 3) Atomic changes (one transaction)
-    #    - mark token used
-    #    - update password + token_version++
-    #    - revoke all sessions
-    #    - audit
     try:
-        # Mark token used (idempotency guard)
         prt.used_at = now
 
         await session.execute(
             update(User)
             .where(User.user_id == user.user_id)
             .values(
-                password_hash=hash_password(payload.new_password),  # ✅ uses existing hash_password
+                password_hash=hash_password(payload.new_password),
                 password_changed_at=now,
-                token_version=User.token_version + 1,  # ✅ kills all access tokens
+                token_version=User.token_version + 1,
                 failed_login_count=0,
             )
         )
 
-        await session.execute(
+        # Revoke all sessions
+        res_revoke = await session.execute(
             update(Session)
             .where(Session.user_id == user.user_id, Session.revoked_at.is_(None))
             .values(revoked_at=now, revoked_reason="password_reset_logout_all")
+            .returning(Session.session_id)
+        )
+        revoked_count = len(res_revoke.all())
+
+        # ✅ Security event: password reset completed
+        await write_security_event(
+            session,
+            event_type="password_reset_completed",
+            severity="info",
+            user_id=user.user_id,
+            details={"sessions_revoked": revoked_count},
+            request=request,
         )
 
         session.add(
@@ -195,9 +248,7 @@ async def reset_password(
         await session.rollback()
         raise
 
-    # Clear refresh cookie for this browser (best-effort)
     clear_refresh_cookie(response)
-
     return {"ok": True}
 
 
@@ -215,6 +266,15 @@ async def change_password(
     now = _now_utc()
 
     if not verify_password(payload.current_password, user.password_hash):
+        await write_security_event(
+            session,
+            event_type="password_change_failed_invalid_current_password",
+            severity="warning",
+            user_id=user.user_id,
+            details={},
+            request=request,
+        )
+        await session.commit()
         raise HTTPException(status_code=400, detail="Current password is incorrect")
 
     await session.execute(
@@ -228,10 +288,21 @@ async def change_password(
         )
     )
 
-    await session.execute(
+    res_revoke = await session.execute(
         update(Session)
         .where(Session.user_id == user.user_id, Session.revoked_at.is_(None))
         .values(revoked_at=now, revoked_reason="password_change_logout_all")
+        .returning(Session.session_id)
+    )
+    revoked_count = len(res_revoke.all())
+
+    await write_security_event(
+        session,
+        event_type="password_change_completed",
+        severity="info",
+        user_id=user.user_id,
+        details={"sessions_revoked": revoked_count},
+        request=request,
     )
 
     await session.commit()
@@ -253,16 +324,27 @@ async def logout_all(
     """
     now = _now_utc()
 
-    await session.execute(
+    res_revoke = await session.execute(
         update(Session)
         .where(Session.user_id == user.user_id, Session.revoked_at.is_(None))
         .values(revoked_at=now, revoked_reason="logout_all")
+        .returning(Session.session_id)
     )
+    revoked_count = len(res_revoke.all())
 
     await session.execute(
         update(User)
         .where(User.user_id == user.user_id)
         .values(token_version=User.token_version + 1)
+    )
+
+    await write_security_event(
+        session,
+        event_type="logout_all",
+        severity="info",
+        user_id=user.user_id,
+        details={"sessions_revoked": revoked_count},
+        request=request,
     )
 
     await session.commit()
