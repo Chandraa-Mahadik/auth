@@ -8,7 +8,7 @@ import time
 import uuid
 
 from app.db import get_session
-from app.models import User, Session, LoginEvent
+from app.models import User, Session, LoginEvent, RefreshTokenHistory
 from app.schemas import LoginIn, TokenOut
 from app.core.security import (
     verify_password,
@@ -24,35 +24,52 @@ from app.deps.auth import get_current_user
 from app.core.redis_client import get_redis
 from app.security.rate_limit import token_bucket_allow
 
+from app.core.cookies import set_refresh_cookie, clear_refresh_cookie, REFRESH_COOKIE_NAME
+
+# ✅ Security events
+from app.services.security_events import write_security_event
+
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 log = logging.getLogger("app")
-
-REFRESH_COOKIE_NAME = "refresh_token"
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def set_refresh_cookie(response: Response, token: str, *, secure: bool):
-    response.set_cookie(
-        key=REFRESH_COOKIE_NAME,
-        value=token,
-        httponly=True,
-        secure=secure,  # True in prod (https + domain), False on localhost
-        samesite="lax",
-        domain=settings.APP_COOKIE_DOMAIN or None,
-        max_age=settings.REFRESH_TOKEN_EXPIRES_DAYS * 24 * 3600,
-        path="/auth",
-    )
+async def insert_refresh_history(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID | None,
+    session_family_id: uuid.UUID | None,
+    token_hash: str,
+    ip: str | None,
+    user_agent: str | None,
+    device: dict | None,
+) -> None:
+    """
+    Insert a history row for a refresh token hash.
 
-
-def clear_refresh_cookie(response: Response):
-    response.delete_cookie(
-        key=REFRESH_COOKIE_NAME,
-        domain=settings.APP_COOKIE_DOMAIN or None,
-        path="/auth",
-    )
+    If the hash already exists, that's a critical signal: the same refresh token
+    got minted twice (should never happen) or reuse occurred and we somehow got
+    here on a "mint" path. We'll treat as server error to surface quickly.
+    """
+    try:
+        session.add(
+            RefreshTokenHistory(
+                user_id=user_id,
+                session_id=session_id,
+                session_family_id=session_family_id,
+                token_hash=token_hash,
+                ip=ip,
+                user_agent=user_agent,
+                device=device,
+            )
+        )
+    except Exception:
+        raise
 
 
 @router.post("/login", response_model=TokenOut)
@@ -90,6 +107,7 @@ async def login(
         if not ip_allowed or not email_allowed:
             reason = "rate_limited_ip" if not ip_allowed else "rate_limited_email"
 
+            # existing audit
             session.add(
                 LoginEvent(
                     user_id=None,
@@ -102,6 +120,20 @@ async def login(
                     subdomain=subdomain_of(payload.app_base_url),
                 )
             )
+
+            # ✅ security event
+            await write_security_event(
+                session,
+                event_type="login_rate_limited",
+                severity="high",
+                user_id=None,
+                details={
+                    "reason": reason,
+                    "email": email_norm,
+                },
+                request=request,
+            )
+
             await session.commit()
             raise HTTPException(status_code=429, detail="Too many attempts. Please wait.")
 
@@ -109,19 +141,81 @@ async def login(
         res = await session.execute(select(User).where(User.email == payload.email))
         user = res.scalar_one_or_none()
 
-        if not user or not user.is_active or not verify_password(payload.password, user.password_hash):
-            if user:
-                await session.execute(
-                    update(User)
-                    .where(User.user_id == user.user_id)
-                    .values(failed_login_count=User.failed_login_count + 1)
-                )
+        # Decide event taxonomy without changing external response semantics
+        if not user:
+            # ✅ security event (don’t leak externally; this is internal)
+            await write_security_event(
+                session,
+                event_type="login_failed_user_not_found",
+                severity="warning",
+                user_id=None,
+                details={"email": email_norm},
+                request=request,
+            )
 
             session.add(
                 LoginEvent(
-                    user_id=(user.user_id if user else None),
+                    user_id=None,
                     success=False,
-                    failure_reason=("inactive" if user and not user.is_active else "bad_credentials"),
+                    failure_reason="bad_credentials",
+                    ip=ip,
+                    user_agent=ua,
+                    device=device,
+                    app_base_url=(str(payload.app_base_url) if payload.app_base_url else None),
+                    subdomain=subdomain_of(payload.app_base_url),
+                )
+            )
+            await session.commit()
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        if not user.is_active:
+            await write_security_event(
+                session,
+                event_type="login_blocked_inactive_user",
+                severity="high",
+                user_id=user.user_id,
+                details={"email": email_norm},
+                request=request,
+            )
+
+            session.add(
+                LoginEvent(
+                    user_id=user.user_id,
+                    success=False,
+                    failure_reason="inactive",
+                    ip=ip,
+                    user_agent=ua,
+                    device=device,
+                    app_base_url=(str(payload.app_base_url) if payload.app_base_url else None),
+                    subdomain=subdomain_of(payload.app_base_url),
+                )
+            )
+            await session.commit()
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        if not verify_password(payload.password, user.password_hash):
+            # increment failed count (existing)
+            await session.execute(
+                update(User)
+                .where(User.user_id == user.user_id)
+                .values(failed_login_count=User.failed_login_count + 1)
+            )
+
+            # ✅ security event
+            await write_security_event(
+                session,
+                event_type="login_failed_invalid_password",
+                severity="warning",
+                user_id=user.user_id,
+                details={"email": email_norm},
+                request=request,
+            )
+
+            session.add(
+                LoginEvent(
+                    user_id=user.user_id,
+                    success=False,
+                    failure_reason="bad_credentials",
                     ip=ip,
                     user_agent=ua,
                     device=device,
@@ -150,6 +244,19 @@ async def login(
             last_seen_at=now,
         )
         session.add(sess)
+        await session.flush()  # sess.session_id available
+
+        # Insert refresh token history row for minted token
+        await insert_refresh_history(
+            session,
+            user_id=user.user_id,
+            session_id=sess.session_id,
+            session_family_id=family_id,
+            token_hash=refresh_hash,
+            ip=ip,
+            user_agent=ua,
+            device=device,
+        )
 
         await session.execute(
             update(User)
@@ -170,9 +277,24 @@ async def login(
             )
         )
 
+        # ✅ optional security event (keep INFO to avoid noise)
+        await write_security_event(
+            session,
+            event_type="login_success",
+            severity="info",
+            user_id=user.user_id,
+            session_id=sess.session_id,
+            session_family_id=family_id,
+            details={},
+            request=request,
+        )
+
         await session.commit()
 
-        access = create_access_token(str(user.user_id), extra={"email": user.email})
+        access = create_access_token(
+            str(user.user_id),
+            extra={"email": user.email, "tv": int(user.token_version or 0)},
+        )
 
         # DEV headers (optional)
         import jwt
@@ -202,6 +324,7 @@ async def refresh(
 ):
     token_plain = request.cookies.get(REFRESH_COOKIE_NAME)
     if not token_plain:
+        # (Optional) log, but don’t try DB writes if you want this super lean.
         raise HTTPException(status_code=401, detail="No refresh token")
 
     ip = get_client_ip(request)
@@ -212,7 +335,7 @@ async def refresh(
         now = utcnow()
         token_hash = hash_refresh_token(token_plain)
 
-        # 1) Find ACTIVE session
+        # 1) Find ACTIVE session by hash
         res = await session.execute(
             select(Session, User)
             .join(User, Session.user_id == User.user_id)
@@ -225,27 +348,44 @@ async def refresh(
         row = res.first()
 
         if not row:
-            # 2) Reuse detection check (token exists but no longer active)
-            res2 = await session.execute(select(Session).where(Session.refresh_token_hash == token_hash))
-            old_sess = res2.scalar_one_or_none()
+            # 2) If token_hash exists in history => reuse detected
+            hist_res = await session.execute(
+                select(RefreshTokenHistory).where(RefreshTokenHistory.token_hash == token_hash)
+            )
+            hist = hist_res.scalar_one_or_none()
 
-            if old_sess and old_sess.session_family_id:
-                family_id = old_sess.session_family_id
-
-                await session.execute(
-                    update(Session)
-                    .where(Session.session_family_id == family_id, Session.revoked_at.is_(None))
-                    .values(
-                        revoked_at=now,
-                        revoked_reason="compromised_refresh_reuse",
-                        compromised_at=now,
-                        compromised_reason="refresh_token_reuse_detected",
+            if hist:
+                # Revoke the entire family if we have it; else revoke all sessions for safety
+                if hist.session_family_id:
+                    await session.execute(
+                        update(Session)
+                        .where(
+                            Session.user_id == hist.user_id,
+                            Session.session_family_id == hist.session_family_id,
+                            Session.revoked_at.is_(None),
+                        )
+                        .values(
+                            revoked_at=now,
+                            revoked_reason="compromised_refresh_reuse",
+                            compromised_at=now,
+                            compromised_reason="refresh_token_reuse_detected",
+                        )
                     )
-                )
+                else:
+                    await session.execute(
+                        update(Session)
+                        .where(Session.user_id == hist.user_id, Session.revoked_at.is_(None))
+                        .values(
+                            revoked_at=now,
+                            revoked_reason="compromised_refresh_reuse",
+                            compromised_at=now,
+                            compromised_reason="refresh_token_reuse_detected",
+                        )
+                    )
 
                 session.add(
                     LoginEvent(
-                        user_id=old_sess.user_id,
+                        user_id=hist.user_id,
                         success=False,
                         failure_reason="refresh_token_reuse",
                         ip=ip,
@@ -256,17 +396,54 @@ async def refresh(
                     )
                 )
 
+                # ✅ security event (must-have)
+                await write_security_event(
+                    session,
+                    event_type="refresh_token_reuse_detected",
+                    severity="high",
+                    user_id=hist.user_id,
+                    session_id=hist.session_id,
+                    session_family_id=hist.session_family_id,
+                    details={
+                        "action": "revoke_family" if hist.session_family_id else "revoke_all_user_sessions",
+                        "reason": "old_refresh_token_used_again",
+                    },
+                    request=request,
+                )
+
+                # (Optional) second event for timeline clarity
+                await write_security_event(
+                    session,
+                    event_type="session_family_revoked",
+                    severity="high",
+                    user_id=hist.user_id,
+                    session_id=hist.session_id,
+                    session_family_id=hist.session_family_id,
+                    details={"reason": "refresh_token_reuse_detected"},
+                    request=request,
+                )
+
                 await session.commit()
                 clear_refresh_cookie(response)
                 raise HTTPException(status_code=401, detail="Refresh token reuse detected. Please login again.")
 
+            # Not in history => just invalid/expired
+            await write_security_event(
+                session,
+                event_type="refresh_failed_invalid_token",
+                severity="warning",
+                user_id=None,
+                details={},
+                request=request,
+            )
+            await session.commit()
             raise HTTPException(status_code=401, detail="Invalid/expired refresh")
 
         old_session, user = row[0], row[1]
 
-        # Ensure family_id exists (for old legacy rows)
+        # Ensure family_id exists
         family_id = old_session.session_family_id or uuid.uuid4()
-        old_session.session_family_id = family_id  # critical: keep old in family too
+        old_session.session_family_id = family_id
 
         # Create new session row (rotation)
         new_plain, new_hash = new_refresh_token()
@@ -283,6 +460,18 @@ async def refresh(
         session.add(new_session)
         await session.flush()  # new_session.session_id available
 
+        # Insert history row for the newly minted refresh token hash
+        await insert_refresh_history(
+            session,
+            user_id=user.user_id,
+            session_id=new_session.session_id,
+            session_family_id=family_id,
+            token_hash=new_hash,
+            ip=ip,
+            user_agent=ua,
+            device=device,
+        )
+
         # Link and revoke old session
         old_session.replaced_by_session_id = new_session.session_id
         old_session.revoked_at = now
@@ -290,12 +479,28 @@ async def refresh(
         old_session.rotated_at = now
         old_session.last_seen_at = now
 
+        # ✅ optional event (INFO)
+        await write_security_event(
+            session,
+            event_type="refresh_success",
+            severity="info",
+            user_id=user.user_id,
+            session_id=new_session.session_id,
+            session_family_id=family_id,
+            details={},
+            request=request,
+        )
+
         await session.commit()
 
         secure_flag = (request.url.scheme == "https") and bool(settings.APP_COOKIE_DOMAIN)
         set_refresh_cookie(response, new_plain, secure=secure_flag)
 
-        access = create_access_token(str(user.user_id), extra={"email": user.email})
+        access = create_access_token(
+            str(user.user_id),
+            extra={"email": user.email, "tv": int(user.token_version or 0)},
+        )
+
         return TokenOut(access_token=access)
 
     except HTTPException:
@@ -338,6 +543,19 @@ async def logout(
                 .where(Session.session_family_id == sess.session_family_id, Session.revoked_at.is_(None))
                 .values(revoked_at=now, revoked_reason="logout_family")
             )
+
+            # ✅ security event
+            await write_security_event(
+                session,
+                event_type="logout",
+                severity="info",
+                user_id=sess.user_id,
+                session_id=sess.session_id,
+                session_family_id=sess.session_family_id,
+                details={"action": "revoke_family"},
+                request=request,
+            )
+
             await session.commit()
 
         clear_refresh_cookie(response)
@@ -366,6 +584,17 @@ async def logout_all(
             .where(Session.user_id == user.user_id, Session.revoked_at.is_(None))
             .values(revoked_at=now, revoked_reason="logout_all")
         )
+
+        # ✅ security event
+        await write_security_event(
+            session,
+            event_type="logout_all",
+            severity="info",
+            user_id=user.user_id,
+            details={"action": "revoke_all_sessions"},
+            request=request,
+        )
+
         await session.commit()
         clear_refresh_cookie(response)
         return {"ok": True}
@@ -385,13 +614,12 @@ async def list_sessions(
     List sessions for the current user (active + recently revoked).
     """
     try:
-        # show last N days; tune as needed
         cutoff = utcnow() - timedelta(days=30)
 
         res = await session.execute(
             select(Session)
             .where(Session.user_id == user.user_id)
-            .order_by(Session.created_at.desc())  # assuming created_at exists
+            .order_by(Session.created_at.desc())
         )
         rows = res.scalars().all()
 
@@ -401,7 +629,6 @@ async def list_sessions(
         out = []
         for s in rows:
             if getattr(s, "created_at", None) and s.created_at < cutoff:
-                # keep old if still active; otherwise skip
                 if s.revoked_at is not None:
                     continue
 
