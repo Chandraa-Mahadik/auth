@@ -8,7 +8,7 @@ from app.core.config import settings
 from app.db import get_session
 
 # ✅ Routers (keep these imports explicit so missing routers are obvious)
-from app.routers import auth_router
+from app.routers import auth_router, security_events
 
 # If you add these routers, ensure they exist in app/routers/__init__.py
 # OR import them directly from their module files (recommended).
@@ -46,6 +46,7 @@ if sessions_router is not None:
 if settings.ENABLE_DEBUG_ENDPOINTS:
     from app.routers import dev_router
     app.include_router(dev_router)
+    app.include_router(security_events.router)
 
 
 def custom_openapi():
